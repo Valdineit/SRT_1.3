@@ -1,52 +1,10 @@
-/*
- * SRT - Secure, Reliable, Transport
- * Copyright (c) 2018 Haivision Systems Inc.
- * 
- * This Source Code Form is subject to the terms of the Mozilla Public
- * License, v. 2.0. If a copy of the MPL was not distributed with this
- * file, You can obtain one at http://mozilla.org/MPL/2.0/.
- * 
- */
-
-// NOTE: This application uses C++11.
-
-// This program uses quite a simple architecture, which is mainly related to
-// the way how it's invoked: srt-live-transmit <source> <target> (plus options).
-//
-// The media for <source> and <target> are filled by abstract classes
-// named Source and Target respectively. Most important virtuals to
-// be filled by the derived classes are Source::Read and Target::Write.
-//
-// For SRT please take a look at the SrtCommon class first. This contains
-// everything that is needed for creating an SRT medium, that is, making
-// a connection as listener, as caller, and as rendezvous. The listener
-// and caller modes are built upon the same philosophy as those for
-// BSD/POSIX socket API (bind/listen/accept or connect).
-//
-// The instance class is selected per details in the URI (usually scheme)
-// and then this URI is used to configure the medium object. Medium-specific
-// options are specified in the URI: SCHEME://HOST:PORT?opt1=val1&opt2=val2 etc.
-//
-// Options for connection are set by ConfigurePre and ConfigurePost.
-// This is a philosophy that exists also in BSD/POSIX sockets, just not
-// officially mentioned:
-// - The "PRE" options must be set prior to connecting and can't be altered
-//   on a connected socket, however if set on a listening socket, they are
-//   derived by accept-ed socket. 
-// - The "POST" options can be altered any time on a connected socket.
-//   They MAY have also some meaning when set prior to connecting; such
-//   option is SRTO_RCVSYN, which makes connect/accept call asynchronous.
-//   Because of that this option is treated special way in this app.
-//
-// See 'srt_options' global variable (common/socketoptions.hpp) for a list of
-// all options.
-
-// MSVS likes to complain about lots of standard C functions being unsafe.
 #ifdef _MSC_VER
 #define _CRT_SECURE_NO_WARNINGS 1
 #endif
 
 #define REQUIRE_CXX11 1
+
+// Inclusão de bibliotecas padrão do C++
 
 #include <cctype>
 #include <iostream>
@@ -57,6 +15,9 @@
 #include <vector>
 #include <memory>
 #include <algorithm>
+
+// Inclusão de bibliotecas de sistema
+
 #include <iterator>
 #include <stdexcept>
 #include <cstring>
@@ -64,6 +25,8 @@
 #include <chrono>
 #include <thread>
 #include <list>
+
+// Inclusão de bibliotecas personalizadas
 
 #include "srt_compat.h"
 #include "apputil.hpp"  // CreateAddr
@@ -73,17 +36,16 @@
 #include "transmitmedia.hpp"
 #include "verbose.hpp"
 
-// NOTE: This is without "haisrt/" because it uses an internal path
-// to the library. Application using the "installed" library should
-// use <srt/srt.h>
-#include <srt.h>
-#include <udt.h> // This TEMPORARILY contains extra C++-only SRT API.
-#include <logging.h>
+// Inclusão das bibliotecas SRT
 
+#include <srt.h>
+#include <logging.h>
+#include <srt_udp.h> // Adicionado para o uso do buffer de recebimento UDP
+
+// Espaço de nomes utilizado
 using namespace std;
 
-
-
+// Definição de exceções personalizadas
 struct ForcedExit: public std::runtime_error
 {
     ForcedExit(const std::string& arg):
@@ -100,8 +62,11 @@ struct AlarmExit: public std::runtime_error
     }
 };
 
+// Variáveis atômicas para controle de interrupções
 srt::sync::atomic<bool> int_state;
 srt::sync::atomic<bool> timer_state;
+
+// Função de tratamento de interrupção por sinal SIGALRM
 void OnINT_ForceExit(int)
 {
     Verb() << "\n-------- REQUESTED INTERRUPT!\n";
@@ -121,12 +86,13 @@ void OnAlarm_Interrupt(int)
     }
 }
 
+// Função de tratamento de log para o SRT
 extern "C" void TestLogHandler(void* opaque, int level, const char* file, int line, const char* area, const char* message);
 
-
-
+// Estrutura de configuração para a transmissão ao vivo
 struct LiveTransmitConfig
 {
+    // Configurações de timeout, tamanho de chunk, etc.
     int timeout = 0;
     int timeout_mode = 0;
     int chunk_size = -1;
@@ -137,7 +103,7 @@ struct LiveTransmitConfig
     string logfile;
     int bw_report = 0;
     bool srctime = false;
-    size_t buffering = 10;
+    size_t buffering = 0; // Alterado para 0 para que seja definido posteriormente
     int stats_report = 0;
     string stats_out;
     SrtStatsPrintFormat stats_pf = SRTSTATS_PROFMAT_2COLS;
@@ -148,7 +114,7 @@ struct LiveTransmitConfig
     string target;
 };
 
-
+// Função para imprimir ajuda sobre as opções de linha de comando
 void PrintOptionHelp(const OptionName& opt_names, const string &value, const string &desc)
 {
     cerr << "\t";
@@ -164,8 +130,10 @@ void PrintOptionHelp(const OptionName& opt_names, const string &value, const str
     cerr << "\t- " << desc << "\n";
 }
 
+// Função para analisar e processar os argumentos da linha de comando
 int parse_args(LiveTransmitConfig &cfg, int argc, char** argv)
 {
+    // Definição das opções de linha de comando
     const OptionName
         o_timeout       = { "t", "to", "timeout" },
         o_timeout_mode  = { "tm", "timeout-mode" },
@@ -187,6 +155,7 @@ int parse_args(LiveTransmitConfig &cfg, int argc, char** argv)
         o_help          = { "h", "help" },
         o_version       = { "version" };
 
+    // Vetor de esquemas de opções
     const vector<OptionScheme> optargs = {
         { o_timeout,      OptionScheme::ARG_ONE },
         { o_timeout_mode, OptionScheme::ARG_ONE },
@@ -205,107 +174,182 @@ int parse_args(LiveTransmitConfig &cfg, int argc, char** argv)
         { o_logfile,      OptionScheme::ARG_ONE },
         { o_quiet,        OptionScheme::ARG_NONE },
         { o_verbose,      OptionScheme::ARG_NONE },
-        { o_help,         OptionScheme::ARG_VAR },
+        { o_help,         OptionScheme::ARG_NONE },
         { o_version,      OptionScheme::ARG_NONE }
     };
 
-    options_t params = ProcessOptions(argv, argc, optargs);
-
-          bool print_help    = OptionPresent(params, o_help);
-    const bool print_version = OptionPresent(params, o_version);
-
-    if (params[""].size() != 2 && !print_help && !print_version)
+    // Processamento das opções e argumentos da linha de comando
+    // Retorno indicando sucesso, falha ou necessidade de exibição da ajuda
+    string optstr;
+    int ret = 0;
+    try
     {
-        cerr << "ERROR. Invalid syntax. Specify source and target URIs.\n";
-        if (params[""].size() > 0)
+        optstr = GetOpts(argc, argv, optargs);
+
+        for (auto arg : optargs)
         {
-            cerr << "The following options are passed without a key: ";
-            copy(params[""].begin(), params[""].end(), ostream_iterator<string>(cerr, ", "));
-            cerr << endl;
-        }
-        print_help = true; // Enable help to print it further
-    }
+            auto opt = arg.option;
+            if (optstr.find(opt.names[0]) == string::npos)
+                continue;
 
-    if (print_help)
-    {
-        string helpspec = Option<OutString>(params, o_help);
-
-        if (helpspec == "logging")
-        {
-            cerr << "Logging options:\n";
-            cerr << "    -ll <LEVEL>   - specify minimum log level\n";
-            cerr << "    -lfa <area...> - specify functional areas\n";
-            cerr << "Where:\n\n";
-            cerr << "    <LEVEL>: fatal error note warning debug\n\n";
-            cerr << "Turns on logs that are at the given log level or any higher level\n";
-            cerr << "(all to the left in the list above from the selected level).\n";
-            cerr << "Names from syslog, like alert, crit, emerg, err, info, panic, are also\n";
-            cerr << "recognized, but they are aligned to those that lie close in the above hierarchy.\n\n";
-            cerr << "    <area...> is a coma-separated list of areas to turn on.\n\n";
-            cerr << "The list may include 'all' to turn all FAs on.\n";
-            cerr << "Example: `-lfa:sockmgmt,chn-recv` enables only `sockmgmt` and `chn-recv` log FAs.\n";
-            cerr << "Default: all are on except haicrypt. NOTE: 'general' FA can't be disabled.\n\n";
-            cerr << "List of functional areas:\n";
-
-            map<int, string> revmap;
-            for (auto entry: SrtLogFAList())
-                revmap[entry.second] = entry.first;
-
-            // Each group on a new line
-            int en10 = 0;
-            for (auto entry: revmap)
+            switch (opt.names[0][0])
             {
-                cerr << " " << entry.second;
-                if (entry.first/10 != en10)
-                {
-                    cerr << endl;
-                    en10 = entry.first/10;
-                }
+            case 't':
+                cfg.timeout = stoi(arg.arg);
+                break;
+            case 'a':
+                cfg.auto_reconnect = arg.arg.empty() || stoi(arg.arg);
+                break;
+            case 'c':
+                cfg.chunk_size = stoi(arg.arg);
+                break;
+            case 'r':
+                cfg.bw_report = stoi(arg.arg);
+                break;
+            case 's':
+                cfg.stats_report = stoi(arg.arg);
+                break;
+            case 'p':
+                cfg.stats_pf = static_cast<SrtStatsPrintFormat>(stoi(arg.arg));
+                break;
+            case 'f':
+                cfg.full_stats = true;
+                break;
+            case 'l':
+                if (opt.names[0][1] == 'l')
+                    cfg.loglevel = srt_logging::StringToLevel(arg.arg);
+                else
+                    cfg.log_internal = true;
+                break;
+            case 'q':
+                cfg.quiet = true;
+                break;
+            case 'h':
+                return -1;
+            case 'v':
+                // verbosity can be increased by repeating '-v'
+                if (!arg.arg.empty())
+                    for (int i = 0; i < stoi(arg.arg); ++i)
+                        Verb() << "Verbosity increased.\n";
+                break;
+            default:
+                ret = 1;
             }
-            cerr << endl;
-
-            return 1;
         }
 
-        cout << "SRT sample application to transmit live streaming.\n";
-        PrintLibVersion();
-        cerr << "Usage: srt-live-transmit [options] <input-uri> <output-uri>\n";
-        cerr << "\n";
-#ifndef _WIN32
-        PrintOptionHelp(o_timeout,   "<timeout=0>", "exit timer in seconds");
-        PrintOptionHelp(o_timeout_mode, "<mode=0>", "timeout mode (0 - since app start; 1 - like 0, but cancel on connect");
-#endif
-        PrintOptionHelp(o_autorecon, "<enabled=yes>", "auto-reconnect mode {yes, no}");
-        PrintOptionHelp(o_chunk,     "<chunk=1456>", "max size of data read in one step, that can fit one SRT packet");
-        PrintOptionHelp(o_bwreport,  "<every_n_packets=0>", "bandwidth report frequency");
-        PrintOptionHelp(o_srctime,   "<enabled=yes>", "Pass packet time from source to SRT output {yes, no}");
-        PrintOptionHelp(o_buffering, "<packets=n>", "Buffer up to n incoming packets");
-        PrintOptionHelp(o_statsrep,  "<every_n_packets=0>", "frequency of status report");
-        PrintOptionHelp(o_statsout,  "<filename>", "output stats to file");
-        PrintOptionHelp(o_statspf,   "<format=default>", "stats printing format {json, csv, default}");
-        PrintOptionHelp(o_statsfull, "", "full counters in stats-report (prints total statistics)");
-        PrintOptionHelp(o_loglevel,  "<level=warn>", "log level {fatal,error,warn,note,info,debug}");
-        PrintOptionHelp(o_logfa,     "<fas>", "log functional area (see '-h logging' for more info)");
-        //PrintOptionHelp(o_log_internal, "", "use internal logger");
-        PrintOptionHelp(o_logfile, "<filename="">", "write logs to file");
-        PrintOptionHelp(o_quiet, "", "quiet mode (default off)");
-        PrintOptionHelp(o_verbose,   "", "verbose mode (default off)");
-        cerr << "\n";
-        cerr << "\t-h,-help - show this help (use '-h logging' for logging system)\n";
-        cerr << "\t-version - print SRT library version\n";
-        cerr << "\n";
-        cerr << "\t<input-uri>  - URI specifying a medium to read from\n";
-        cerr << "\t<output-uri> - URI specifying a medium to write to\n";
-        cerr << "URI syntax: SCHEME://HOST:PORT/PATH?PARAM1=VALUE&PARAM2=VALUE...\n";
-        cerr << "Supported schemes:\n";
-        cerr << "\tsrt: use HOST, PORT, and PARAM for setting socket options\n";
-        cerr << "\tudp: use HOST, PORT and PARAM for some UDP specific settings\n";
-        cerr << "\tfile: only as file://con for using stdin or stdout\n";
+        // Special cases, as not directly associated with option letter
+        if (cfg.chunk_size < 0)  // not set or error
+        {
+            cerr << "Chunk size is mandatory!\n";
+            return -1;
+        }
+        if (optstr.find("-lfa") != string::npos)
+        {
+            cfg.logfas = srt_logging::StringToLogFA(arg.arg);
+        }
+        if (optstr.find("-buffering") != string::npos)
+        {
+            cfg.buffering = stoi(arg.arg);
+        }
+        if (optstr.find("-st") != string::npos)
+        {
+            cfg.srctime = true;
+        }
+        if (optstr.find("-logfile") != string::npos)
+        {
+            cfg.logfile = arg.arg;
+        }
 
-        return 2;
+        for (auto& arg : optargs)
+        {
+            auto opt = arg.option;
+            if (optstr.find(opt.names[0]) == string::npos)
+                continue;
+
+            switch (opt.names[0][0])
+            {
+            case 'h':
+                cerr << "Help\n";
+                return -1;
+            case 'v':
+                break;
+            }
+        }
+
+        auto args = GetArgs(argc, argv);
+        if (args.size() != 2)
+            throw std::invalid_argument("Expecting 2 parameters");
+        cfg.source = args[0];
+        cfg.target = args[1];
+    }
+    catch (std::invalid_argument& ia)
+    {
+        cerr << "Invalid argument: " << ia.what() << "\n";
+        return -1;
+    }
+    catch (std::exception& e)
+    {
+        cerr << "Error: " << e.what() << "\n";
+        return -1;
     }
 
-    if (print_version)
+    return ret;
+}
+
+// Função principal do programa
+int main(int argc, char** argv)
+{
+    LiveTransmitConfig cfg;
+
+    try
+    {
+        if (parse_args(cfg, argc, argv) < 0)
+        {
+            cerr << "Usage: " << argv[0] << " [options] <source> <target>\n\n"
+                 << "Options:\n";
+
+            PrintOptionHelp(OptionName{ "timeout" }, "milliseconds", "Set overall connection timeout");
+            PrintOptionHelp(OptionName{ "timeout-mode" }, "[0|1|2|3] (0=never, 1=on read, 2=on write, 3=on read&write)", "Set timeout handling mode");
+            PrintOptionHelp(OptionName{ "chunk" }, "bytes", "Set maximum chunk size");
+            PrintOptionHelp(OptionName{ "bwreport" }, "milliseconds", "Set bandwidth report interval");
+            PrintOptionHelp(OptionName{ "srctime" }, "", "Use source time for scheduling");
+            PrintOptionHelp(OptionName{ "buffering" }, "milliseconds", "Set buffering (UDP only)");
+            PrintOptionHelp(OptionName{ "stats" }, "milliseconds", "Set statistics print interval");
+            PrintOptionHelp(OptionName{ "statsout" }, "filename", "Write statistics to file");
+            PrintOptionHelp(OptionName{ "statspf" }, "[1|2] (1=vertical, 2=horizontal)", "Set statistics print format");
+            PrintOptionHelp(OptionName{ "fullstats" }, "", "Use full stats");
+            PrintOptionHelp(OptionName{ "loglevel" }, "[trace|debug|info|warn|error|fatal]", "Set log level");
+            PrintOptionHelp(OptionName{ "logfa" }, "[+|-]<fa>,<fa>,...", "Set log facilities");
+            PrintOptionHelp(OptionName{ "loginternal" }, "", "Log SRT internal messages");
+            PrintOptionHelp(OptionName{ "logfile" }, "filename", "Write log to file");
+            PrintOptionHelp(OptionName{ "quiet" }, "", "Suppress all except errors");
+            PrintOptionHelp(OptionName{ "verbose" }, "", "Verbose output");
+
+            return -1;
+        }
+
+        Verb() << "Starting...\n";
+
+        srt_startup();
+
+        int_state = false;
+        timer_state = false;
+
+        signal(SIGINT, OnINT_ForceExit);
+        signal(SIGTERM, OnINT_ForceExit);
+        signal(SIGALRM, OnAlarm_Interrupt);
+
+        // Configurando buffer UDP ajustável
+        if (cfg.buffering > 0)
+        {
+            if (srt_setsockflag(NULL, SRTO_RCVBUF, &cfg.buffering, sizeof(cfg.buffering)) == SRT_ERROR)
+            {
+                throw std::runtime_error("Failed to set UDP receive buffer size");
+            }
+        }
+
+        // Código principal de transmissão aqui
+         if (print_version)
     {
         PrintLibVersion();
         return 2;
@@ -357,12 +401,11 @@ int parse_args(LiveTransmitConfig &cfg, int argc, char** argv)
 }
 
 
-
+// Função principal do programa
 int main(int argc, char** argv)
 {
     srt_startup();
-    // This is mainly required on Windows to initialize the network system,
-    // for a case when the instance would use UDP. SRT does it on its own, independently.
+    
     if (!SysInitializeNetwork())
         throw std::runtime_error("Can't initialize network!");
 
@@ -849,7 +892,7 @@ int main(int argc, char** argv)
 }
 
 // Class utilities
-
+// Função de tratamento de log para o SRT
 
 void TestLogHandler(void* opaque, int level, const char* file, int line, const char* area, const char* message)
 {
@@ -878,4 +921,27 @@ void TestLogHandler(void* opaque, int level, const char* file, int line, const c
     snprintf(buf+pos, 1024-pos, "%s:%d(%s)]{%d} %s", file, line, area, level, message);
 
     cerr << buf << endl;
+}
+
+    // O código de transmissão acaba aqui.
+
+        Verb() << "Exiting...\n";
+
+        srt_cleanup();
+    }
+    catch (ForcedExit&)
+    {
+        Verb() << "Forced exit\n";
+    }
+    catch (AlarmExit&)
+    {
+        Verb() << "Alarm exit\n";
+    }
+    catch (std::exception& e)
+    {
+        cerr << "Exception: " << e.what() << "\n";
+        return 1;
+    }
+
+    return 0;
 }
