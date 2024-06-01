@@ -40,7 +40,7 @@
 
 #include <srt.h>
 #include <logging.h>
-#include <srt_udp.h> // Adicionado para o uso do buffer de recebimento UDP
+// Adicionado para o uso do buffer de recebimento UDP
 
 // Espaço de nomes utilizado
 using namespace std;
